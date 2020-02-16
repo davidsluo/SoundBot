@@ -10,7 +10,7 @@ import aiohttp
 import asyncpg
 import discord
 import youtube_dl
-from discord import VoiceClient, VoiceChannel
+from discord import VoiceClient
 from discord.ext import commands
 from sqlalchemy import and_, select, func, true
 
@@ -51,22 +51,21 @@ class Playback:
 
         self.vclient: Optional[VoiceClient] = None
         self.vchannel = ctx.author.voice.channel
+        self.guild_id = self.ctx.guild.id
 
-    async def connect(self, channel: VoiceChannel):
-        log.debug('Connecting to voice channel.')
-        self.vclient: VoiceClient = self.ctx.guild.voice_client or await channel.connect()
-        await self.vclient.move_to(channel)
-
-    async def play(self):
+    async def _play(self, *, after=None):
         log.debug(
                 f'Playing sound {self.name} ({self.sound_id}) '
                 f'in #{self.vchannel.name} ({self.vchannel.id}) '
-                f'of guild {self.ctx.guild.name} ({self.ctx.guild.id}).'
+                f'of guild {self.ctx.guild.name} ({self.guild_id}).'
         )
 
-        await self.connect(self.ctx.author.voice.channel)
+        log.debug('Connecting to voice channel.')
+        channel = self.ctx.author.voice.channel
+        self.vclient: VoiceClient = self.ctx.guild.voice_client or await channel.connect()
+        await self.vclient.move_to(channel)
 
-        file = self.sound_path / str(self.ctx.guild.id) / self.name
+        file = self.sound_path / str(self.guild_id) / self.name
 
         source = discord.FFmpegPCMAudio(
                 str(file),
@@ -83,17 +82,9 @@ class Playback:
             )
 
             log.debug('Starting playback.')
-            self.vclient.play(source=source, after=self.sync_stop)
+            self.vclient.play(source=source, after=after)
 
-    def sync_stop(self, _error):
-        coro = self.stop()
-        future = asyncio.run_coroutine_threadsafe(coro, self.ctx.bot.loop)
-        try:
-            future.result()
-        except Exception:
-            log.exception('Failed to stop playback.')
-
-    async def stop(self, user=False):
+    async def _stop(self, user=False):
         log.debug('Stopping playback.')
         try:
             vclient = self.ctx.guild.voice_client
@@ -112,6 +103,35 @@ class Playback:
             await vclient.disconnect(force=True)
 
 
+class PlaybackManager:
+    def __init__(self):
+        super().__init__()
+        self.playbacks = {}
+
+    async def play(self, playback: Playback):
+        self.playbacks[playback.guild_id] = playback
+        await playback._play(after=self.sync_stop(playback))
+
+    def sync_stop(self, playback):
+        def actual_stop(_error):
+            coro = self.stop(playback.guild_id)
+            future = asyncio.run_coroutine_threadsafe(coro, playback.ctx.bot.loop)
+            try:
+                future.result()
+            except Exception:
+                log.exception('Failed to stop playback.')
+
+        return actual_stop
+
+    async def stop(self, guild_id: int):
+        try:
+            playback = self.playbacks.pop(guild_id)
+            await playback._stop()
+        except KeyError:
+            # nothing was playing
+            pass
+
+
 # noinspection PyIncorrectDocstring
 class SoundBoard(commands.Cog):
     STOP = '\N{OCTAGONAL SIGN}'
@@ -120,7 +140,7 @@ class SoundBoard(commands.Cog):
         self.sound_path = Path(bot.config.sound_path)
         self.bot = bot
 
-        self.playing = {}
+        self.manager = PlaybackManager()
 
         if not self.sound_path.is_dir():
             self.sound_path.mkdir()
@@ -349,9 +369,7 @@ class SoundBoard(commands.Cog):
 
         playback = Playback(ctx, sound_id, name, self.sound_path, *args)
 
-        self.playing[ctx.guild.id] = playback
-
-        await playback.play()
+        await self.manager.play(playback)
 
     @commands.command()
     @commands.check(is_soundplayer)
@@ -387,13 +405,7 @@ class SoundBoard(commands.Cog):
         """
         Stop playback of the current sound.
         """
-
-        try:
-            playback = self.playing.pop(ctx.guild.id)
-            await playback.stop(user=True)
-        except KeyError:
-            # nothing was playing
-            pass
+        await self.manager.stop(ctx.guild.id)
 
     @commands.command(aliases=['ls'])
     @commands.check(is_soundplayer)
